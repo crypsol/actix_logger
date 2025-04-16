@@ -8,6 +8,8 @@ CLOUDWATCH_AWS_SECRET_KEY: AWS secret key.
 CLOUDWATCH_AWS_REGION: AWS region where you want to upload the logs.
 AWS_LOG_GROUP: CloudWatch Logs group name.
 LOG_TO_CLOUDWATCH: Set this to true if you want to enable logging to CloudWatch.
+BATCH_SIZE: The maximum number of log events to collect before sending a batch (default is 10).
+BATCH_TIMEOUT: The maximum time (in seconds) to wait before flushing the current batch even if the batch size hasn't been reached (default is 5 seconds).
 ```
 
 Logging Macros

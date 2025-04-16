@@ -26,10 +26,39 @@ static NEXT_SEQUENCE_TOKENS: Lazy<RwLock<HashMap<String, Option<String>>>> = Laz
 /// Indicates whether logging to AWS CloudWatch is enabled.
 static LOG_TO_CLOUDWATCH: Lazy<bool> = Lazy::new(|| env::var("LOG_TO_CLOUDWATCH").map(|val| val.to_lowercase() == "true").unwrap_or(false));
 
-// Helper function that returns the value of the static variable.
+/// Helper function that returns the value of the static variable.
 pub fn is_log_to_cloudwatch_enabled() -> bool {
     *LOG_TO_CLOUDWATCH
 }
+
+/// Batch size for sending log events to CloudWatch. Loaded once from the environment.
+static BATCH_SIZE: Lazy<usize> = Lazy::new(|| env::var("BATCH_SIZE").ok().and_then(|s| s.parse().ok()).unwrap_or(10));
+
+/// Timeout duration for batching log events. Loaded once from the environment (in seconds, default 5 sec).
+static BATCH_TIMEOUT: Lazy<std::time::Duration> = Lazy::new(|| {
+    env::var("BATCH_TIMEOUT")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(std::time::Duration::from_secs)
+        .unwrap_or(std::time::Duration::from_secs(5))
+});
+
+/// Represents a single log event to be batched.
+struct BatchLogItem {
+    group: String,
+    stream: String,
+    event: InputLogEvent,
+}
+
+/// A static channel sender for batching log events. This ensures events are buffered and sent as per the batching logic.
+static LOG_BATCH_SENDER: Lazy<tokio::sync::mpsc::Sender<BatchLogItem>> = Lazy::new(|| {
+    let (tx, rx) = tokio::sync::mpsc::channel::<BatchLogItem>(1000);
+    // Spawn the background task to process batched log events.
+    tokio::spawn(async move {
+        process_log_batches(rx).await;
+    });
+    tx
+});
 
 /// A globally shared client for CloudWatch Logs. This approach ensures that only one client instance is created
 /// and reused throughout the program lifecycle. We retrieve necessary credentials and region info from the environment.
@@ -118,7 +147,7 @@ impl LogStream {
 
 /// Sends a custom log message to CloudWatch if the `AWS_LOG_GROUP` environment variable is set,
 /// otherwise returning an error if it is missing. This function ensures the log group and log stream
-/// exist, and then performs the actual PutLogEvents API call with proper sequence token handling.
+/// exist, and then queues the log event for batching.
 ///
 /// # Arguments
 /// * `level` - The log level (e.g., `Level::Info`)
@@ -147,32 +176,28 @@ pub async fn custom_cloudwatch_log(level: Level, message: &str, log_stream: LogS
         Err(_) => return Err(Error::AwsConfig),
     }
 
-    // Perform the log event submission with retry on invalid sequence token
-    match handle_logging_operation(client, log_group_name, log_stream_name, msg_str).await {
-        Ok(_) => Ok(()),
-        Err(_) => Err(Error::AwsConfig),
-    }
-}
-
-/// Internal function to handle constructing the `InputLogEvent` and calling the retry logic.
-async fn handle_logging_operation(client: Arc<CloudWatchLogsClient>, group: String, stream: String, message: String) -> Result<(), Box<dyn error::Error + Send + Sync>> {
     // Build a single log event with current timestamp
-    let log_event = InputLogEvent::builder().message(message).timestamp(Utc::now().timestamp_millis()).build().expect("Failed to build log event");
+    let log_event = InputLogEvent::builder().message(msg_str).timestamp(Utc::now().timestamp_millis()).build().expect("Failed to build log event");
 
-    // Attempt to put the log event with proper sequence token handling
-    put_log_events_with_retry(&client, &group, &stream, log_event).await?;
+    // Queue the log event for batching.
+    let batch_item = BatchLogItem { group: log_group_name, stream: log_stream_name, event: log_event };
+
+    if let Err(_e) = LOG_BATCH_SENDER.send(batch_item).await {
+        return Err(Error::AwsConfig);
+    }
+
     Ok(())
 }
 
-/// Puts log events, retrying once if we receive an `InvalidSequenceTokenException`.
-/// This handles the "sequence token mismatch" scenario by fetching the latest token and retrying.
+/// Sends a batch of log events to CloudWatch, retrying once if an `InvalidSequenceTokenException` occurs.
+/// This is analogous to `put_log_events_with_retry` but handles a vector of events.
 ///
 /// # Arguments
 /// * `client` - The CloudWatchLogs client
 /// * `group` - The log group name
 /// * `stream` - The log stream name
-/// * `log_event` - The `InputLogEvent` to be sent
-async fn put_log_events_with_retry(client: &CloudWatchLogsClient, group: &str, stream: &str, log_event: InputLogEvent) -> Result<(), Box<dyn error::Error + Send + Sync>> {
+/// * `events` - The vector of `InputLogEvent` to be sent
+async fn put_log_events_batch_with_retry(client: &CloudWatchLogsClient, group: &str, stream: &str, events: Vec<InputLogEvent>) -> Result<(), Box<dyn error::Error + Send + Sync>> {
     let key = format!("{}::{}", group, stream);
 
     // Retrieve any stored sequence token for this log stream
@@ -181,19 +206,22 @@ async fn put_log_events_with_retry(client: &CloudWatchLogsClient, group: &str, s
         map.get(&key).cloned().unwrap_or(None)
     };
 
-    // First attempt
-    match put_log_events_once(client, group, stream, token_opt, vec![log_event.clone()]).await {
+    let mut attempt_count = 1;
+    match put_log_events_once(client, group, stream, token_opt, events.clone()).await {
         Ok(new_tok) => {
             update_sequence_token(key, new_tok).await;
+            log::debug!("Log batch sent successfully in {} attempt(s)", attempt_count);
             Ok(())
         }
         Err(e) => {
             // If there's an invalid sequence token error, fetch the latest token and retry once
             if let Some(PutLogEventsError::InvalidSequenceTokenException(_)) = e.downcast_ref::<PutLogEventsError>() {
+                attempt_count += 1;
                 let fresh = fetch_latest_stream_token(client, group, stream).await;
-                match put_log_events_once(client, group, stream, fresh.clone(), vec![log_event]).await {
+                match put_log_events_once(client, group, stream, fresh.clone(), events).await {
                     Ok(new_tok2) => {
                         update_sequence_token(format!("{}::{}", group, stream), new_tok2).await;
+                        log::debug!("Log batch sent successfully in {} attempt(s)", attempt_count);
                         Ok(())
                     }
                     Err(e2) => Err(e2),
@@ -335,6 +363,53 @@ async fn ensure_log_group_exists(client: &CloudWatchLogsClient, group: &str) -> 
     }
 
     Ok(())
+}
+
+/// Processes batched log events. Groups events by (log group, log stream) and flushes them when the batch size
+/// reaches the threshold or the timeout expires. This ensures that in development when logs are infrequent,
+/// events are still flushed after the timeout.
+///
+/// Note: This function respects API call limits by batching events.
+async fn process_log_batches(mut rx: tokio::sync::mpsc::Receiver<BatchLogItem>) {
+    use std::collections::HashMap;
+    use tokio::time;
+    let mut batches: HashMap<(String, String), Vec<InputLogEvent>> = HashMap::new();
+    let mut interval = time::interval(*BATCH_TIMEOUT);
+    loop {
+        tokio::select! {
+            maybe_item = rx.recv() => {
+                if let Some(item) = maybe_item {
+                    let key = (item.group, item.stream);
+                    batches.entry(key.clone()).or_default().push(item.event);
+                    // If the batch size for this key reaches the threshold, flush immediately.
+                    if let Some(events) = batches.get(&key) {
+                        if events.len() >= *BATCH_SIZE {
+                            let events_to_send = batches.remove(&key).unwrap();
+                            let client = GLOBAL_CLIENT.clone();
+                            // Spawn a task to send the batch
+                            tokio::spawn(async move {
+                                let _ = put_log_events_batch_with_retry(&client, &key.0, &key.1, events_to_send).await;
+                            });
+                        }
+                    }
+                } else {
+                    // Channel closed, flush remaining batches.
+                    break;
+                }
+            },
+            _ = interval.tick() => {
+                // On timeout tick, flush all non-empty batches.
+                for (key, events) in batches.drain() {
+                    if !events.is_empty() {
+                        let client = GLOBAL_CLIENT.clone();
+                        tokio::spawn(async move {
+                            let _ = put_log_events_batch_with_retry(&client, &key.0, &key.1, events).await;
+                        });
+                    }
+                }
+            },
+        }
+    }
 }
 
 /// Initializes logs by setting up env_logger and installing a custom panic hook. The panic hook logs
