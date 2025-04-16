@@ -1,6 +1,6 @@
 #[macro_use]
 pub mod logs;
-
+pub use log::Level;
 /*
  * This file provides two macros for logging:
  * 1) `log!` for standard usage (maps to a log level and auto-selects a log stream).
@@ -20,10 +20,7 @@ pub mod logs;
 #[macro_export]
 macro_rules! log {
     ($level:expr, $($arg:tt)+) => {{
-        let log_to_cloudwatch = std::env::var("LOG_TO_CLOUDWATCH")
-            .unwrap_or_else(|_| "false".to_string()) == "true";
-
-        if log_to_cloudwatch {
+        if $crate::logs::is_log_to_cloudwatch_enabled() {
             let message_str = format!($($arg)+);
             let log_stream = $crate::logs::LogStream::from_level(&$level);
 

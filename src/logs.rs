@@ -23,6 +23,14 @@ static STREAM_EXISTS_CACHE: Lazy<RwLock<HashMap<String, bool>>> = Lazy::new(|| R
 /// A static map of log-stream keys to their latest sequence tokens, allowing for proper CloudWatch log event ordering.
 static NEXT_SEQUENCE_TOKENS: Lazy<RwLock<HashMap<String, Option<String>>>> = Lazy::new(|| RwLock::new(HashMap::new()));
 
+/// Indicates whether logging to AWS CloudWatch is enabled.
+static LOG_TO_CLOUDWATCH: Lazy<bool> = Lazy::new(|| env::var("LOG_TO_CLOUDWATCH").map(|val| val.to_lowercase() == "true").unwrap_or(false));
+
+// Helper function that returns the value of the static variable.
+pub fn is_log_to_cloudwatch_enabled() -> bool {
+    *LOG_TO_CLOUDWATCH
+}
+
 /// A globally shared client for CloudWatch Logs. This approach ensures that only one client instance is created
 /// and reused throughout the program lifecycle. We retrieve necessary credentials and region info from the environment.
 static GLOBAL_CLIENT: Lazy<Arc<CloudWatchLogsClient>> = Lazy::new(|| {
